@@ -768,6 +768,9 @@ class StrataEngine:
             return
         self.progress = None
         self.prefill_tok_s_mean = None
+        # the tests build the engine with __new__ (no __init__): make sure the per-thread slot exists
+        if not hasattr(self, "_tls"):
+            self._tls = threading.local()
         self._tls.pp = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
