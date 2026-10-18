@@ -47,6 +47,7 @@ struct Glm5Model::RowsState {
     float *row_kin = nullptr, *kda_backup = nullptr;           // per-row KDA inputs; per-window-slot KDA snapshots
     int n_kda = 0;
     size_t kda_run_floats = 0, kin_layer_floats = 0;
+    bool kda_gather_off = false;   // A/B gate: the old six-copy staging loop (STRATA_GLM_KDA_GATHER=0)
     std::vector<int> kin_of;
     std::vector<int> pending_seqs;
     std::vector<int64_t> pending_pos;
@@ -100,6 +101,8 @@ bool Glm5Model::rows_alloc(std::string& err) {
     S->kda_run_floats = (size_t) g.d_inner() * g.kda_head_dim +
                         (size_t) 3 * g.d_inner() * (g.d_conv - 1);
     S->kin_layer_floats = (size_t) 3 * g.d_inner() + 2 * g.kda_head_dim + g.n_head;
+    S->kda_gather_off = std::getenv("STRATA_GLM_KDA_GATHER") != nullptr &&
+                        std::strcmp(std::getenv("STRATA_GLM_KDA_GATHER"), "0") == 0;
     uint8_t* base = nullptr;
     size_t at = 0;
     const auto take = [&](size_t row_bytes) -> uint8_t* {   // R rows of row_bytes (256-aligned as a block)
@@ -435,18 +438,37 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
             j[5] = {Ly.beta, nullptr, S->x, S->beta, nullptr, 1.0f, gf::kTypeBF16, E, g.n_head};
             if (!mv(j, 6, "kda projections")) return false;
             const int kin_layer = S->kin_of[(size_t) il];
-            for (int i = 0; i < n; ++i) {
-                float* dst = S->row_kin + ((size_t) i * S->n_kda + (size_t) kin_layer) * S->kin_layer_floats;
-                float* src[6] = {rows(S->proj[0], DI, i), rows(S->proj[1], DI, i), rows(S->proj[2], DI, i),
-                                 rows(S->fa, g.kda_head_dim, i), rows(S->ga, g.kda_head_dim, i), rows(S->beta, g.n_head, i)};
-                const size_t nbytes[6] = {(size_t) DI * sizeof(float), (size_t) DI * sizeof(float),
-                                          (size_t) DI * sizeof(float), (size_t) g.kda_head_dim * sizeof(float),
-                                          (size_t) g.kda_head_dim * sizeof(float), (size_t) g.n_head * sizeof(float)};
-                size_t off = 0;
-                for (int j = 0; j < 6; ++j) {
-                    cudaMemcpyAsync(dst + off, src[j], nbytes[j], cudaMemcpyDeviceToDevice, s);
-                    off += nbytes[j] / sizeof(float);
+            if (S->kda_gather_off) {   // A/B gate: the old six-copy staging loop (STRATA_GLM_KDA_GATHER=0)
+                for (int i = 0; i < n; ++i) {
+                    float* dst = S->row_kin + ((size_t) i * S->n_kda + (size_t) kin_layer) * S->kin_layer_floats;
+                    float* src[6] = {rows(S->proj[0], DI, i), rows(S->proj[1], DI, i), rows(S->proj[2], DI, i),
+                                     rows(S->fa, g.kda_head_dim, i), rows(S->ga, g.kda_head_dim, i), rows(S->beta, g.n_head, i)};
+                    const size_t nbytes[6] = {(size_t) DI * sizeof(float), (size_t) DI * sizeof(float),
+                                              (size_t) DI * sizeof(float), (size_t) g.kda_head_dim * sizeof(float),
+                                              (size_t) g.kda_head_dim * sizeof(float), (size_t) g.n_head * sizeof(float)};
+                    size_t off = 0;
+                    for (int j = 0; j < 6; ++j) {
+                        cudaMemcpyAsync(dst + off, src[j], nbytes[j], cudaMemcpyDeviceToDevice, s);
+                        off += nbytes[j] / sizeof(float);
+                    }
                 }
+            } else {   // one fused launch instead of n rows x 6 staging copies
+                gf::KdaGatherArgs ga;
+                ga.src[0] = rows(S->proj[0], DI, 0);
+                ga.src[1] = rows(S->proj[1], DI, 0);
+                ga.src[2] = rows(S->proj[2], DI, 0);
+                ga.src[3] = rows(S->fa, g.kda_head_dim, 0);
+                ga.src[4] = rows(S->ga, g.kda_head_dim, 0);
+                ga.src[5] = rows(S->beta, g.n_head, 0);
+                ga.row_kin = S->row_kin;
+                ga.n_rows = n;
+                ga.n_kda = S->n_kda;
+                ga.kin_layer = kin_layer;
+                ga.kin_layer_floats = (int) S->kin_layer_floats;
+                ga.di = DI;
+                ga.hd = g.kda_head_dim;
+                ga.nh = g.n_head;
+                gf::kda_gather(ga, s);
             }
             for (int i = 0; i < n; ++i) {
                 gf::KdaPrepArgs k;
