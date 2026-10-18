@@ -2,6 +2,7 @@
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/kernels/exl3.hpp"
 #include "strata/kernels/glm_fast.hpp"
 
 #include <cuda_runtime.h>
