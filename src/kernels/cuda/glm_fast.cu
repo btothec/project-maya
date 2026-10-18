@@ -2373,6 +2373,31 @@ __global__ void __launch_bounds__(128) kda_prep_layers_kernel(const __grid_const
     kda_prep_block(b.a[blockIdx.z], blockIdx.x, blockIdx.y);
 }
 
+// ---- the rows path's per-row KDA staging gather -------------------------------------------
+// The six projection outputs (q/k/v proj, f_a, g_a, beta) go into one contiguous
+// per-(row, layer) staging record: 3*d_inner + 2*head_dim + n_head floats, in exactly the
+// layout the old six cudaMemcpyAsync calls produced (proj0 | proj1 | proj2 | fa | ga | beta).
+// One kernel replaces n rows x 6 copies (2,160 launches per 8-row window before).
+// The args struct lives in the public header; the kernel reads it by value.
+__global__ void __launch_bounds__(256) kda_gather_kernel(const __grid_constant__ KdaGatherArgs a) {
+    // one block per row, threads sweep the record's six pieces flat
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int widths[6] = {a.di, a.di, a.di, a.hd, a.hd, a.nh};
+    // per-piece row strides: proj rows are d_inner apart, fa/ga head-dim, beta n_head apart
+    const int strides[6] = {a.di, a.di, a.di, a.hd, a.hd, a.nh};
+    float* dst = a.row_kin + ((size_t) row * a.n_kda + a.kin_layer) * a.kin_layer_floats;
+    int base = 0;
+#pragma unroll
+    for (int p = 0; p < 6; ++p) {
+        const int w = widths[p];
+        const float* src = a.src[p] + (size_t) row * strides[p];   // THIS row's piece
+        for (int i = base + tid; i < base + w; i += blockDim.x)
+            dst[i] = src[i - base];
+        base += w;
+    }
+}
+
 // one block (head h) of kda_rec; out == nullptr: the state only (a commit's replay)
 __device__ __forceinline__ void kda_rec_block(const float* __restrict__ q, const float* __restrict__ k,
                                               const float* __restrict__ v, const float* __restrict__ g1,
@@ -4875,6 +4900,11 @@ void embed_streams(const float* emb, float* R, int n_embd, cudaStream_t s) {
 void kda_prep(const KdaPrepArgs& a, cudaStream_t s) {
     kda_prep_kernel<<<dim3(a.n_head, 11), 128, 0, s>>>(a);   // 3 conv roles + 2 x 4 gate quarters
     launch_check("kda_prep");
+}
+
+void kda_gather(const KdaGatherArgs& a, cudaStream_t s) {
+    kda_gather_kernel<<<dim3(a.n_rows), 256, 0, s>>>(a);
+    launch_check("kda_gather");
 }
 
 void kda_rec(const float* q, const float* k, const float* v, const float* g1, const float* beta_raw, float* state,
