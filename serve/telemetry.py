@@ -21,9 +21,8 @@ HISTORY = 60
 
 
 # ------------------------------------------------------------------------------------------------ NVML
-def gpu_pids():
-    """Every process with a compute context on any NVIDIA GPU (NVML), or None when that can't be read (no NVIDIA driver,
-    an AMD card, an old driver)."""
+def nvml_count():
+    """How many NVIDIA GPUs NVML sees, or None when that can't be read (no NVIDIA driver, an AMD card)."""
     first = _Nvml(0)
     if not first.ok():
         return None
@@ -34,9 +33,18 @@ def gpu_pids():
             return None
     except (AttributeError, OSError):
         return None
+    return count.value
+
+
+def gpu_pids():
+    """Every process with a compute context on any NVIDIA GPU (NVML), or None when that can't be read (no NVIDIA driver,
+    an AMD card, an old driver)."""
+    n = nvml_count()
+    if n is None:
+        return None
     out = set()
-    for i in range(count.value):
-        p = (first if i == 0 else _Nvml(i)).pids()
+    for i in range(n):
+        p = _Nvml(i).pids()
         if p is None:
             return None
         out |= p
@@ -250,6 +258,14 @@ class Telemetry:
         self.gpus = [(i, g) for i, g in self.gpus if g.ok()] or self.gpus[:1]
         self.gpu = self.gpus[0][1]
         self.cards = [(i, g.pci(), g.name()) for i, g in self.gpus] if self.gpu.ok() else []   # (the GPU map's)
+        # every NVIDIA card NVML sees (not just the engine's): the GPU map gives a card of its own to the GPU
+        # helper's cache (STRATA_GLM_EXPERT_HELPER), which the engine reports as a VRAM line but does not run on
+        n = nvml_count()
+        have = dict(self.gpus)
+        self.map_gpus = ([(i, have[i]) for i in sorted(have)] +
+                          [(i, _Nvml(i)) for i in range(n or 0) if i not in have]) if n is not None else list(self.gpus)
+        self.map_gpus = [(i, g) for i, g in self.map_gpus if g.ok()]
+        self.map_cards = [(i, g.pci(), g.name()) for i, g in self.map_gpus] if self.gpu.ok() else []
         try:
             import psutil  # noqa: F401
             self.ps = sys.modules["psutil"]
@@ -296,16 +312,21 @@ class Telemetry:
                 g["util"] = sum(u) / len(u) if u else None
                 t = vals("temp")
                 g["temp"] = max(t) if t else None
+            s.update({f"gpu_{k}": v for k, v in g.items()})
+            # every card's memory, readings and processes, for the Monitor's map of a GPU (serve/gpu_map.py):
+            # the engine's cards first (their readings already taken), then the others (the GPU helper's card)
+            by_engine = dict(reads)
+            allreads = {i: (by_engine.get(i) or x.read()) for i, x in self.map_gpus}
+            if len(allreads) > 1:
                 s["gpus"] = [{"index": i, "util": r.get("util"), "mem_used": r.get("mem_used"),
                               "mem_total": r.get("mem_total"), "temp": r.get("temp"), "power": r.get("power"),
                               "power_limit": r.get("power_limit"), "pcie_gen": r.get("pcie_gen"),
                               "pcie_gen_max": r.get("pcie_gen_max"), "pcie_width": r.get("pcie_width"),
                               "pcie_rx_mb": r.get("pcie_rx_mb")}
-                             for i, r in reads]
-            s.update({f"gpu_{k}": v for k, v in g.items()})
-            # each card's memory and the processes holding it, for the Monitor's map of a GPU (serve/gpu_map.py)
-            s["vram"] = [{"index": i, "pci": pci, "name": name, "used": r.get("mem_used"), "total": r.get("mem_total"),
-                          "procs": g.procs()} for (i, pci, name), (_, r), (_, g) in zip(self.cards, reads, self.gpus)]
+                             for i, r in sorted(allreads.items())]
+            s["vram"] = [{"index": i, "pci": pci, "name": name, "used": allreads[i].get("mem_used"),
+                          "total": allreads[i].get("mem_total"), "procs": x.procs()}
+                         for (i, pci, name), (_, x) in zip(self.map_cards, self.map_gpus)]
         if self.ps:
             try:
                 s["cpu"] = self.ps.cpu_percent(interval=None)
@@ -330,7 +351,7 @@ class Telemetry:
             with self.lock:
                 self.now = s
                 for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",
-                          "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
+                          "disk_read_mb", "tok_s", "prefill_tok_s_mean", "queued"):
                     v = s.get(k)
                     self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
             time.sleep(1.0)

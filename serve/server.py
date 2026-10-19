@@ -116,6 +116,13 @@ class MockEngine:
         self.last_prompt: list[int] = []
         self.info = {"logit_bias": 1}   # it samples nothing, so every request's bias is as good as applied
 
+    # what the tests (and the server) hang off a stand-in engine: the live STAT reading and its history for the
+    # Monitor's sparklines, the VRAM lines and the engine's process for the GPU map
+    stat: dict
+    stat_history: list
+    vram: list
+    proc: object
+
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_prompt = list(ids)
         self.last_embeddings = embeddings
@@ -1609,7 +1616,8 @@ class Service:
         if getattr(self, "telemetry", None) is None:
             from serve.telemetry import Telemetry
             self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(), "tok_s_mean": self._tok_s_mean(),
-                                                    "prefill_tok_s_mean": self._prefill_tok_s_mean()},
+                                                    "prefill_tok_s_mean": self._prefill_tok_s_mean(),
+                                                    "queued": self.status.get("queued") or 0},
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None))
             if isinstance(self.engine, StrataEngine):
@@ -1644,9 +1652,18 @@ class Service:
         return sum(r["generated"] for r in decoding) / max(1e-6, time.time() - min(r["first_token"] for r in decoding))
 
     def _prefill_tok_s_mean(self):
-        """Engine-reported mean over newly read tokens, excluding the cached prefix."""
+        """Engine-reported mean over newly read tokens, excluding cached prefixes.
+
+        With fair-read / multi-sequence service, one request can be decoding while another is
+        still reading a prompt. Keep the prefill readout alive until every active request has
+        received its first token.
+        """
         with self.status_lock:
-            reading = self.status.get("busy") and self.status.get("first_token") is None
+            reading = any(r.get("in_engine") and r.get("first_token") is None
+                          for r in self.live_requests.values())
+            # Single-request tests and older callers populate status but not live_requests.
+            if not self.live_requests:
+                reading = self.status.get("busy") and self.status.get("first_token") is None
         return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
 
     def metrics(self, all_requests=False) -> dict:
@@ -1658,9 +1675,11 @@ class Service:
             totals = dict(self.totals)
             active = self.active
             current = [dict(r) for r in self.live_requests.values() if r.get("in_engine")]
+            all_live = [dict(r) for r in self.live_requests.values()]
         now = time.time()
         progress = getattr(self.engine, "progress", None)
         decoding = [r for r in current if r.get("first_token")]
+        reading_current = any(r.get("first_token") is None for r in current)
         primary = max(current, key=lambda r: r.get("updated", r["started"])) if current else None
         if decoding:
             state = "generating"
@@ -1680,9 +1699,10 @@ class Service:
                 "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
                 "tok_s_mean": round(self._tok_s_mean(), 1) if state == "generating" else None,
                 "tok_s_per_request": round(aggregate_rate / len(decoding), 1) if aggregate_rate is not None and decoding else None,
-                "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
-                "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
-        if state == "reading" and progress:
+                "prefill_tok_s_mean": self._prefill_tok_s_mean() if s.get("busy") else None,
+                "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None,
+                "fair_read_pauses": max((r.get("fair_read_pauses") or 0) for r in all_live) if all_live else None}
+        if reading_current and progress:
             live["prompt_read"], live["prompt_total"] = progress[0], progress[1]
         engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {}), "maya_version": MAYA_VERSION,
@@ -1696,7 +1716,8 @@ class Service:
         if stat:
             sh = list(getattr(self.engine, "stat_history", []) or [])
             tiers = {"now": stat, "history": {k: [s.get(k) for s in sh] for k in
-                                              ("tok_s", "ms_tok", "vram_hit", "ram_fetch", "disk", "promo")}}
+                                              ("tok_s", "ms_tok", "vram_hit", "ram_fetch", "disk", "promo",
+                                               "helper_fetch", "helper_used", "helper_ms_tok")}}
         hw = dict(tel["now"])
         cards = hw.pop("vram", None)                      # (each card's processes: for the GPU map only)
         return {"engine": engine, "live": live, "tiers": tiers, "gpu_map": self._gpu_map(cards),
@@ -1725,7 +1746,14 @@ class Service:
                  "disk": "Experts a token read from the SSD",
                  "promo": "Experts a token promoted into VRAM",
                  "vram_used": "Expert slots in use in VRAM", "vram_slots": "Expert slots in VRAM",
-                 "ram_used": "Expert slots in use in RAM", "ram_slots": "Expert slots in RAM"}
+                 "ram_used": "Expert slots in use in RAM", "ram_slots": "Expert slots in RAM",
+                 "helper_fetch": "Experts a token the GPU helper cache served",
+                 "helper_hit": "Share of routed experts the GPU helper cache served (0..1)",
+                 "helper_used": "Expert slots the GPU helper cache holds",
+                 "helper_ram": "Helper-held experts that also sit in the RAM tier",
+                 "helper_gb": "GiB of expert blobs in the GPU helper cache",
+                 "helper_ms_tok": "The helper lane's compute time per token, ms",
+                 "helper_swaps": "Ownership swaps the GPU helper cache made"}
 
     def prometheus(self) -> str:
         """GET /metrics/prometheus: the totals and what is running in Prometheus' text format, under llama-server's
@@ -1987,7 +2015,11 @@ class Service:
                             self.engine.pause()
                             pausing = paused_read = True
                             paused_at = time.monotonic()
-                        continue
+                            with self.status_lock:      # the Monitor's pauses count for this request
+                                lv = self.live_requests.get(live_id)
+                                if lv is not None:
+                                    lv["fair_read_pauses"] = lv.get("fair_read_pauses", 0) + 1
+                            continue
                     produced.append(t)
                     if t0 is None:
                         t0 = time.monotonic()
@@ -2018,7 +2050,7 @@ class Service:
                 self.status["busy"] = self.active > 0
                 self.status["queued"] += 1
                 if live_id in self.live_requests:
-                    self.live_requests[live_id]["in_engine"] = False
+                    self.live_requests[live_id].update(in_engine=False, queued_at=time.time())
             waiting = self.fifo.waiting()
             place = self.fifo.enqueue(units=1)          # in line before letting go: behind whoever waits now
             hold[0] = False
@@ -2046,7 +2078,10 @@ class Service:
                                                          "tool", "tail", "max_tokens") if k in mine},
                                    generated=len(produced))
                 if live_id in self.live_requests:
-                    self.live_requests[live_id]["in_engine"] = True
+                    lv = self.live_requests[live_id]
+                    lv["in_engine"] = True
+                    if lv.get("queued_at") is not None:     # back in turn: this queue episode joins the wait
+                        lv["queue_wait_s"] = round(lv.get("queue_wait_s", 0) + time.time() - lv.pop("queued_at"), 3)
                 self.rate.clear()
             if paused_read and getattr(self.engine, "multi", 0):
                 # several conversations at once: the engine would take this prompt up at once and block the other
@@ -2102,6 +2137,7 @@ class Service:
         engine_last0 = getattr(self.engine, "last", None)
         counted, my_started, my_first = False, time.time(), None
         live_id = next(self._live_ids)
+        queued_at = time.time()                     # the queue wait starts when the request arrives
         with self.status_lock:
             self.status["queued"] += 1
         hold = [False, False]                           # holds the FIFO (fair slices let go of it); counts as active
@@ -2130,7 +2166,9 @@ class Service:
                     my_started = self.status["started"]
                     self.live_requests[live_id] = {"started": my_started, "updated": my_started, "in_engine": True,
                                                    "prompt_tokens": len(ids), "max_tokens": max_new, "generated": 0,
-                                                   "first_token": None, "phase": "reading the prompt"}
+                                                   "first_token": None, "phase": "reading the prompt",
+                                                   "queue_wait_s": round(time.time() - queued_at, 3), "queued_at": None,
+                                                   "fair_read_pauses": 0}
                     self.last_request_at = time.time()
                 before = getattr(self.engine, "last", None)
                 last_print = time.time()
@@ -2256,6 +2294,7 @@ class Service:
                     started = my_started
                     loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
                     hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
+                    lv = self.live_requests.get(live_id) or {}      # ttft / queue wait / pauses from the live entry
                     self.history.append({
                         "projection": (sampling or {}).get("experimental_speed_projection") is not False
                         if loaded else None,
@@ -2268,7 +2307,10 @@ class Service:
                         "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
                         "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                         if n and last.get("generated") and last.get("decode_ms") else None,
-                        "hit_rate": hit_rate})
+                        "hit_rate": hit_rate,
+                        "ttft_s": round(lv["first_token"] - my_started, 3) if lv.get("first_token") else None,
+                        "queue_wait_s": lv.get("queue_wait_s"),
+                        "fair_read_pauses": lv.get("fair_read_pauses") or 0})
                     t = self.totals
                     t["requests"] += 1
                     t["prompt_tokens"] += len(ids)
@@ -2948,6 +2990,7 @@ def make_handler(svc: Service):
                 body = (ROOT / "serve" / "web" / "index.html").read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")   # the shell must follow its /web script and styles
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -3312,7 +3355,7 @@ class Server(ThreadingHTTPServer):
             super().handle_error(request, client_address)
 
 
-SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_HTTP_BACKLOG", "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S")
+SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_HTTP_BACKLOG", "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S", "STRATA_FAIR_READ_S", "STRATA_FAIR_READ_YIELD_S")
 
 
 def apply_server_env(cfg: dict) -> None:

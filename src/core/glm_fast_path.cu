@@ -3790,6 +3790,20 @@ Glm5Model::FastStats Glm5Model::fast_stats() const {
             s.ram_slots += R.n;
             for (char c : R.st) s.ram_used += c == FastState::kRHold || c == FastState::kRNew || c == FastState::kRHelper;
         }
+        if (F->helper.device() >= 0) {
+            // the helper's complementary cache (one trunk GPU): what it holds and serves, and which of its experts
+            // also sit in the RAM tier (the tier bar serves those from the helper, not over PCIe)
+            s.helper_experts += F->helper_experts.load();
+            s.helper_routes += F->helper_routes.load();
+            s.helper_swaps += F->helper_swaps;
+            s.helper_ms += (double) F->helper_us.load() / 1000.0;
+            s.helper_used += F->helper.owned();
+            s.helper_gb += (double) F->helper.used() / 1073741824.0;
+            s.helper_dev = F->helper.device();
+            const auto& own = F->helper.owners();
+            for (size_t k = 0; k < own.size(); ++k)
+                if (own[k] && F->ram_of[k] >= 0) ++s.helper_served_ram;
+        }
     }
     if (fast_ != nullptr) {
         s.tokens = fast_->tokens;
@@ -3832,6 +3846,27 @@ std::vector<Glm5Model::VramReport> Glm5Model::vram_report() const {
         r.l0 = m->l0_;
         r.l1 = m->l1_;
         out.push_back(r);
+    }
+    // the GPU helper's own card (STRATA_GLM_EXPERT_HELPER on a discrete second GPU): one VRAM line of its own, so
+    // the Monitor's map shows the card its cache fills - the helper computes there from experts the trunk GPU
+    // does not hold (integrated helpers alias the RAM tier: no pool of their own, no line)
+    for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        const FastState* F = m->fast_;
+        if (F == nullptr || F->helper.device() < 0 || F->helper.integrated()) continue;
+        VramReport h;
+        h.dev = F->helper.device();
+        cudaSetDevice(h.dev);
+        size_t fr = 0, tot = 0;
+        if (cudaMemGetInfo(&fr, &tot) == cudaSuccess) {
+            h.free = fr;
+            h.total = tot;
+        }
+        char bus[32] = {};
+        if (cudaDeviceGetPCIBusId(bus, (int) sizeof bus, h.dev) == cudaSuccess) h.pci = bus;
+        h.helper = F->helper.capacity();
+        h.l0 = h.l1 = -1;                                // no layers here: the card is the cache alone
+        cudaGetLastError();
+        out.push_back(h);
     }
     cudaSetDevice(cur);
     return out;

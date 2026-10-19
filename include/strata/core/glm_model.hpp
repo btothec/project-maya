@@ -133,6 +133,12 @@ public:
         double ms = 0, miss_ms = 0, disk_ms = 0, cpu_ms = 0;
         int64_t pool_slots = 0, pool_used = 0, ram_slots = 0, ram_used = 0;
         double pool_gb = 0, ram_gb = 0;
+        // the GPU helper's complementary cache (STRATA_GLM_EXPERT_HELPER): experts it holds and serves, the RAM-tier
+        // slots whose expert it also holds (the tier bar moves those from "over PCIe" to the helper), its swaps
+        uint64_t helper_experts = 0, helper_routes = 0, helper_swaps = 0;
+        int64_t helper_used = 0, helper_served_ram = 0;
+        double helper_ms = 0, helper_gb = 0;
+        int helper_dev = -1;
     };
     FastStats fast_stats() const;
     /// What a part holds on its GPU, in bytes (generate's VRAM lines, the Monitor's map of a GPU): the device's total
@@ -147,6 +153,7 @@ public:
         uint64_t total = 0, free = 0;
         uint64_t weights = 0, kv = 0, kv_ram = 0, act = 0, drafter = 0, window = 0;
         uint64_t pool = 0, tail = 0, borrow = 0, vision = 0;
+        uint64_t helper = 0;    // the GPU helper's cache pool on this card (its own VRAM line, discrete helpers only)
         int64_t slots = 0, ctx = 0;
         int l0 = 0, l1 = 0;
     };

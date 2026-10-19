@@ -587,7 +587,8 @@ class PrometheusMetrics(unittest.TestCase):
     def test_text_and_key(self):
         tok = ByteTokenizer()
         eng = MockEngine(tok, "</think>\n\nok", max_context=CTX)
-        eng.stat = {"tok_s": 21.5, "vram_hit": 0.95, "promo": "x", "time": 1.0}
+        eng.stat = {"tok_s": 21.5, "vram_hit": 0.95, "promo": "x", "helper_fetch": 1.25, "helper_used": 2600,
+                    "helper_hit": 0.31, "time": 1.0}
         svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
@@ -605,6 +606,9 @@ class PrometheusMetrics(unittest.TestCase):
             self.assertGreater(int(lines["llamacpp:tokens_predicted_total"]), 0)
             self.assertEqual(lines["llamacpp:requests_deferred"], "0")
             self.assertEqual((lines["maya:engine_tok_s"], lines["maya:engine_vram_hit"]), ("21.5", "0.95"))
+            self.assertEqual(lines["maya:engine_helper_fetch"], "1.25")
+            self.assertEqual(lines["maya:engine_helper_used"], "2600")
+            self.assertEqual(lines["maya:engine_helper_hit"], "0.31")
             self.assertNotIn("maya:engine_promo", lines)          # not a number: left out
             self.assertIn("# TYPE llamacpp:prompt_tokens_total counter", text)
             svc.api_key = "k1"
@@ -618,6 +622,18 @@ class PrometheusMetrics(unittest.TestCase):
         finally:
             httpd.shutdown()
             httpd.server_close()
+
+    def test_tiers_history_carries_the_helper_series(self):
+        """The Monitor's sparklines: the helper cache's served rate and stored count ride the tiers history."""
+        tok = ByteTokenizer()
+        eng = MockEngine(tok, "</think>\n\nok", max_context=CTX)
+        eng.stat = {"tok_s": 20.0, "helper_fetch": 1.1, "helper_used": 2600, "time": 1.0}
+        eng.stat_history = [eng.stat, {"tok_s": 19.0, "helper_fetch": 0.9, "helper_used": 2600, "time": 2.0}]
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        tiers = svc.metrics()["tiers"]
+        self.assertEqual(tiers["history"]["helper_fetch"], [1.1, 0.9])
+        self.assertEqual(tiers["history"]["helper_used"], [2600, 2600])
+        self.assertNotIn("helper_swaps", tiers["history"])   # only the series the Monitor draws
 
 
 class GpuChoice(unittest.TestCase):
@@ -915,6 +931,28 @@ class LiveRate(unittest.TestCase):
         self.svc.status["busy"] = False
         self.assertIsNone(self.metrics()["live"]["prefill_tok_s_mean"])
 
+    def test_prefill_rate_remains_while_another_request_decodes(self):
+        """Fair-read can leave one request in prefill while another is already generating."""
+        now = time.time()
+        setattr(self.engine, "prefill_tok_s_mean", 1234.0)
+        setattr(self.engine, "progress", (10000, 20000, 0, 1000.0))
+        self.svc.live_requests = {
+            1: {"in_engine": True, "first_token": now - 1, "generated": 20,
+                "started": now - 2, "updated": now, "phase": "answering", "prompt_tokens": 8,
+                "max_tokens": 32},
+            2: {"in_engine": True, "first_token": None, "generated": 0,
+                "started": now - 3, "updated": now, "phase": "reading the prompt", "prompt_tokens": 20000,
+                "max_tokens": 32},
+        }
+        self.svc.active = 2
+        self.svc.status.update(busy=True, first_token=now - 1, generated=20)
+        self.assertEqual(self.svc._prefill_tok_s_mean(), 1234.0)
+        live = self.svc.metrics()["live"]
+        self.assertEqual(live["state"], "generating")
+        self.assertEqual(live["prefill_tok_s_mean"], 1234.0)
+        self.assertEqual(live["prompt_read"], 10000)
+        self.assertEqual(live["prompt_total"], 20000)
+
     def test_the_live_number_is_a_rate(self):
         live_samples, stop = [], threading.Event()
 
@@ -945,6 +983,38 @@ class LiveRate(unittest.TestCase):
                         f"for a {true_rate:.1f} tok/s engine")
         self.assertEqual(self.metrics()["live"]["state"], "idle")
         self.assertIsNone(self.metrics()["live"]["tok_s"])
+
+    def test_a_finished_request_records_ttft_queue_wait_and_pauses(self):
+        """The Monitor's new columns: time to first token, queue wait, and the fair-read pause count."""
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x" * self.TOKENS, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            body = json.dumps({"model": "m", "max_tokens": self.TOKENS, "temperature": 0,
+                               "messages": [{"role": "user", "content": "hi"}]}).encode()
+            with urllib.request.urlopen(urllib.request.Request(base + "/v1/chat/completions", data=body,
+                                                               headers={"Content-Type": "application/json"}),
+                                        timeout=30) as r:
+                r.read()
+            row = svc.metrics()["requests"][0]
+            self.assertIsNotNone(row["ttft_s"], "the first token's time was not recorded")
+            self.assertGreaterEqual(row["ttft_s"], row["queue_wait_s"],
+                                    "ttft must include the queue wait, not sit below it")
+            self.assertLess(row["queue_wait_s"], 1.0, "an uncontended request barely waits")
+            self.assertEqual(row["fair_read_pauses"], 0)
+            hist = None
+            deadline = time.time() + 3                  # the hardware sampler ticks about once a second
+            while time.time() < deadline:
+                hist = svc.telemetry.snapshot()["history"]
+                if hist.get("queued"):
+                    break
+                time.sleep(0.1)
+            self.assertTrue(hist and hist.get("queued"), "the queue depth is not being sampled")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
 
     def test_two_live_requests_report_aggregate_and_per_request_decode_rates(self):
         """With an engine that admits two streams, the monitor separates their combined rate from each request's rate."""

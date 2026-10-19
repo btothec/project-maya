@@ -247,6 +247,10 @@ const METRICS = [
   {key: "cpu", label: "CPU", icon: "cpu", unit: "%", series: "cpu", max: 100},
   {key: "ram", label: "System RAM", icon: "memory", unit: "GB", series: "ram_used", tone: "info"},
   {key: "disk", label: "Disk read", icon: "disk", unit: "MB/s", series: "disk_read_mb", tone: "info"},
+  {key: "queued", label: "Queued", icon: "clock", unit: "", series: "queued", tone: "info",
+   tip: "Requests waiting for the engine. A long prompt read holds the door; fair-read pauses it at a chunk boundary so the waiting request can run."},
+  {key: "cache", label: "Cache reuse", icon: "copy", unit: "%", series: "cache_hit", tone: "info",
+   tip: "The share of a request's prompt tokens the conversation cache already held - the engine's kept conversations serve those without reading them again. The line is the recent requests, oldest first."},
 ];
 $("metrics").innerHTML = METRICS.map((m) => `
   <div class="st-card metric-card"${m.tip ? ` title="${esc(m.tip)}"` : ""}><div class="st-metric">
@@ -264,9 +268,10 @@ const TIERS = [
   {key: "ram_fetch", label: "From RAM", icon: "link", unit: "/tok", digits: 2, tone: "info"},
   {key: "disk", label: "From SSD", icon: "disk", unit: "/tok", digits: 2, tone: "warn"},
   {key: "promo", label: "Promoted", icon: "bolt", unit: "/tok", digits: 2},
+  {key: "helper_fetch", label: "From GPU-1 cache", icon: "gpu", unit: "/tok", digits: 2, tone: "info"},
 ];
 $("tiers").innerHTML = TIERS.map((m) => `
-  <div class="st-card metric-card"><div class="st-metric">
+  <div class="st-card metric-card"${m.tip ? ` title="${esc(m.tip)}"` : ""}><div class="st-metric">
     <span class="st-metric__label">${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
     <span class="st-metric__value" id="tv-${m.key}">–</span>
     <span class="st-metric__sub" id="ts-${m.key}"></span>
@@ -274,7 +279,8 @@ $("tiers").innerHTML = TIERS.map((m) => `
       <path class="area" fill="currentColor" opacity=".12"/><path class="line" fill="none" stroke="currentColor"
       stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/></svg>
   </div></div>`).join("");
-const TIER_SUB = {ram_fetch: "experts pulled over PCIe from RAM", disk: "experts read from the SSD", promo: "experts moved into VRAM"};
+const TIER_SUB = {ram_fetch: "experts pulled over PCIe from RAM", disk: "experts read from the SSD", promo: "experts moved into VRAM",
+                  helper_fetch: "experts the second GPU serves from its own cache"};
 function renderTiers(t, eng) {
   const card = $("tiers-card");
   if (!t || !t.now) { card.hidden = true; return; }
@@ -290,15 +296,30 @@ function renderTiers(t, eng) {
     $(`ts-${m.key}`).textContent = (stale ? "last answer: " : "") + (TIER_SUB[m.key] || "");
     spark(`tp-${m.key}`, (h[m.key] || []).map((x) => (x == null ? 0 : x)), m.max);
   }
+  const hu = n.helper_used || 0, hr = n.helper_ram || 0;   // helper-held, and those also in the RAM tier
+  const hasHelper = (eng && eng.helper) || hu > 0;
+  const helperTile = $("tv-helper_fetch") ? $("tv-helper_fetch").closest(".metric-card") : null;
+  if (helperTile) helperTile.hidden = !hasHelper;          // the app's [hidden] rule beats any display style
+  const helperSub = hasHelper
+      ? `${fmt(hu)} experts · ${fmt(n.helper_gb, 1)} GB on GPU ${eng && eng.helper_dev != null ? eng.helper_dev : 1}` +
+        (n.helper_swaps ? ` · ${fmt(n.helper_swaps)} swaps` : "")
+      : TIER_SUB.helper_fetch;
   const vu = n.vram_used || 0, ru = n.ram_used || 0;
-  const total = (eng && eng.experts) || Math.max(1, vu + ru);
-  const disk = Math.max(0, total - vu - ru);
+  const total = (eng && eng.experts) || Math.max(1, vu + ru + hu - hr);
+  // where a routed expert is served from: the helper's copies leave the RAM bucket (no PCIe pull), and the helper
+  // experts without a RAM slot leave the SSD bucket
+  const ram = Math.max(0, ru - hr);
+  const disk = Math.max(0, total - vu - ru - (hu - hr));
   $("tierbar-vram").style.width = `${(100 * vu) / total}%`;
-  $("tierbar-ram").style.width = `${(100 * ru) / total}%`;
+  $("tierbar-ram").style.width = `${(100 * ram) / total}%`;
+  if ($("tierbar-helper")) $("tierbar-helper").style.width = `${(100 * hu) / total}%`;
   $("tierbar-disk").style.width = `${(100 * disk) / total}%`;
   $("tier-vram-text").textContent = `${fmt(vu)} experts · ${fmt(n.vram_gb, 1)} GB`;
-  $("tier-ram-text").textContent = `${fmt(ru)} experts · ${fmt(n.ram_gb, 1)} GB`;
+  $("tier-ram-text").textContent = `${fmt(ram)} experts · ${fmt(n.ram_gb, 1)} GB`;
+  if ($("tier-helper-item")) $("tier-helper-item").hidden = !hasHelper;
+  if ($("tier-helper-text")) $("tier-helper-text").textContent = hasHelper ? `${fmt(hu)} experts · ${fmt(n.helper_gb, 1)} GB` : "–";
   $("tier-disk-text").textContent = `${fmt(disk)} experts`;
+  if ($("ts-helper_fetch")) $("ts-helper_fetch").textContent = (stale ? "last answer: " : "") + helperSub;
   $("tiers-sub").textContent = age == null ? "" : stale ? `last reading ${ago(age)} ago, from the last answer`
                                                         : `live · ${fmt(total)} routed experts`;
   // advice from the live numbers (only while they are fresh)
@@ -307,6 +328,8 @@ function renderTiers(t, eng) {
     tip = "Many experts are read from the SSD for every token: more RAM, a smaller model or a shorter context makes answers faster.";
   } else if (!stale && n.vram_hit != null && n.vram_hit < 0.85 && (n.ram_fetch || 0) >= 4) {
     tip = "Most misses come from RAM over PCIe: more VRAM (or a second GPU) keeps more experts on the card.";
+  } else if (!stale && hasHelper && (n.helper_hit || 0) >= 0.45) {
+    tip = `The GPU-1 cache serves ${fmt((n.helper_hit || 0) * 100, 0)}% of the routed experts - the complementary cache is carrying this workload.`;
   }
   $("tier-advice").hidden = !tip;
   $("tier-advice").textContent = tip;
@@ -318,7 +341,8 @@ function renderTiers(t, eng) {
 // one GPU: its row, opened (the hardware cards have its readings)
 const GPU_PARTS = [
   {key: "weights", label: "Model weights"}, {key: "kv", label: "KV cache"}, {key: "act", label: "Activations"},
-  {key: "drafter", label: "Drafter"}, {key: "pool", label: "Expert pool"}, {key: "vision", label: "Vision encoder"},
+  {key: "drafter", label: "Drafter"}, {key: "pool", label: "Expert pool"}, {key: "helper", label: "GPU-1 cache"},
+  {key: "vision", label: "Vision encoder"},
   {key: "rest", label: "CUDA and the rest"}, {key: "other", label: "Other programs"},
 ];
 const GIB = 1073741824;
@@ -367,6 +391,7 @@ function gpuDetail(g, segs, m) {
       .filter(Boolean).join(" · "),
     pool: [g.slots ? `${fmt(g.slots)} expert slots` : "", g.borrow ? `prompts borrow up to ${gb(g.borrow)} GB of it` : ""]
       .filter(Boolean).join(" · "),
+    helper: "complementary experts the second GPU holds and computes itself",
     vision: g.vision_lent ? "the pool's tail, while it encodes" : "its own process",
     rest: "the driver's reserve and context, conversation snapshots and small buffers",
     other: "processes that are not Maya's",
@@ -631,8 +656,11 @@ function renderHero(live, h, last, eng, tiers, totals) {
                           : last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null)
                 : null;
   $("hero-prefill").textContent = prefill == null ? "–" : fmt(prefill);
-  $("hero-prefill-sub").textContent = "prefill · " + (live.state === "reading" ? "reading now" : gen ? "this request"
-                                      : last ? "last request" : "waiting");
+  const readingSub = live.state === "reading"
+      ? (live.fair_read_pauses ? `reading now · ${live.fair_read_pauses} fair-read pause${live.fair_read_pauses > 1 ? "s" : ""}`
+                               : "reading now") : null;
+  $("hero-prefill-sub").textContent = "prefill · " + (readingSub || (gen ? "this request"
+                                      : last ? "last request" : "waiting"));
   const a = spark("hero-spark", h.tok_s);
   const b = spark("hero-spark-prefill", h.prefill_tok_s_mean);
   $("hero-spark-wrap").classList.toggle("is-empty", !a && !b);
@@ -741,11 +769,19 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, gpuEa
   setMetric("ram", hw.ram_used == null ? null : gb(hw.ram_used), hw.ram_total ? `/ ${gb(hw.ram_total, 0)} GB` : "GB",
             eng.ram_gb ? `${fmt(+eng.ram_gb, 1)} GB pinned for experts` : "");
   spark("sp-ram", h.ram_used, hw.ram_total);
+  // queue depth over time, and the conversation cache's reuse over the recent requests (oldest first)
+  setMetric("queued", live.queued == null ? null : fmt(live.queued), "",
+            live.queued ? "waiting for the engine" : "");
+  spark("sp-queued", h.queued);
+  const cache = (requests || []).filter((r) => r.prompt_tokens).slice(0, 60).map((r) => (r.reused || 0) / r.prompt_tokens);
+  setMetric("cache", cache.length ? fmt(cache[0] * 100, 1) : null, "%",
+            totals.prompt_tokens ? `${fmt((totals.reused || 0) / totals.prompt_tokens * 100, 1)}% of all prompt tokens` : "");
+  spark("sp-cache", cache.length ? [...cache].reverse() : h.cache_hit, 100);
 
   // recent requests
   const body = $("req-body");
   if (!requests.length) {
-    body.innerHTML = `<tr><td colspan="9" class="muted">No requests yet</td></tr>`;
+    body.innerHTML = `<tr><td colspan="12" class="muted">No requests yet</td></tr>`;
   } else {
     const badges = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
                     disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
@@ -756,8 +792,12 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, gpuEa
       const hit = r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%`;
       const pre = r.prefill_tok_s != null ? r.prefill_tok_s
                 : r.prompt_ms > 0 && r.prompt_tokens > (r.reused || 0) ? (r.prompt_tokens - (r.reused || 0)) / (r.prompt_ms / 1000) : null;
+      const ttft = r.ttft_s != null ? `${fmt(r.ttft_s, 1)} s` : "–";
+      const wait = r.queue_wait_s != null ? `${fmt(r.queue_wait_s, 1)} s` : "–";
+      const pauses = r.fair_read_pauses ? fmt(r.fair_read_pauses) : "–";
       return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span>${api}</td><td class="num">${fmt(r.prompt_tokens)}</td>
-        <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(pre)}</td><td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
+        <td class="num">${fmt(r.reused)}</td><td class="num">${fmt(pre)}</td><td class="num">${ttft}</td><td class="num">${wait}</td><td class="num">${pauses}</td>
+        <td class="num">${fmt(r.output_tokens)}</td><td class="num">${fmt(r.decode_tok_s, 1)}</td>
         <td class="num">${hit}</td><td class="num">${fmt(r.duration_s, 1)} s</td></tr>`;
     }).join("");
   }

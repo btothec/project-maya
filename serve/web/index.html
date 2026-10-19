@@ -188,11 +188,13 @@
         <div class="tierbar" id="tierbar" aria-label="Experts by tier">
           <span class="tierbar__seg tierbar__seg--vram" id="tierbar-vram" style="width:0%"></span>
           <span class="tierbar__seg tierbar__seg--ram" id="tierbar-ram" style="width:0%"></span>
+          <span class="tierbar__seg tierbar__seg--helper" id="tierbar-helper" style="width:0%"></span>
           <span class="tierbar__seg tierbar__seg--disk" id="tierbar-disk" style="width:0%"></span>
         </div>
         <div class="tierlegend">
           <div class="tierlegend__item"><i class="dot dot--vram"></i><span>VRAM</span><b id="tier-vram-text">&ndash;</b></div>
           <div class="tierlegend__item"><i class="dot dot--ram"></i><span>Pinned RAM</span><b id="tier-ram-text">&ndash;</b></div>
+          <div class="tierlegend__item" id="tier-helper-item" hidden><i class="dot dot--helper"></i><span>GPU 1 cache</span><b id="tier-helper-text">&ndash;</b></div>
           <div class="tierlegend__item"><i class="dot dot--disk"></i><span>SSD only</span><b id="tier-disk-text">&ndash;</b></div>
         </div>
         <div class="metrics metrics--tiers" id="tiers"></div>
@@ -225,9 +227,13 @@
           <div class="table-wrap" id="req-wrap">
             <table class="st-table">
               <thead><tr><th>Time</th><th>Status</th><th class="num">Prompt</th><th class="num" title="Prompt tokens the conversation cache already held">Reused</th>
-                <th class="num" title="Prompt tokens read per second (the reused ones not counted)">Prefill</th><th class="num">Output</th>
+                <th class="num" title="Prompt tokens read per second (the reused ones not counted)">Prefill</th>
+                <th class="num" title="Time from the request arriving to its first answer token: queue wait plus the prompt read">TTFT</th>
+                <th class="num" title="Time spent waiting in the queue before the engine took the request">Wait</th>
+                <th class="num" title="Fair-read pauses: the prompt read paused at a chunk boundary so another request could use the engine">Pauses</th>
+                <th class="num">Output</th>
                 <th class="num" title="Answer tokens written per second">Decode</th><th class="num" title="While writing the answer: the share of the routed experts that were already in VRAM">VRAM hit</th><th class="num">Duration</th></tr></thead>
-              <tbody id="req-body"><tr><td colspan="9" class="muted">No requests yet</td></tr></tbody>
+              <tbody id="req-body"><tr><td colspan="12" class="muted">No requests yet</td></tr></tbody>
             </table>
           </div>
           <p class="muted req-totals" id="req-totals"></p>

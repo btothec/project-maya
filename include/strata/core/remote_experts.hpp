@@ -32,9 +32,16 @@ public:
                             int experts_per_layer, int max_swaps) const;
     const std::vector<uint8_t>& owners() const { return owned_; }
     bool owns(int key) const { return !owned_.empty() && owned_[(size_t) key] != 0; }
+    /// How many keys the helper owns now (the Monitor's expert count for this cache).
+    int owned() const {
+        int n = 0;
+        for (uint8_t o : owned_) n += o != 0;
+        return n;
+    }
     bool integrated() const { return integrated_; }
     size_t available() const { return capacity_ - used_; }
     size_t used() const { return used_; }
+    size_t capacity() const { return capacity_; }
     bool compute(int gu_type, int d_type, size_t down_off, float limit, int ne,
                  const int* keys, const float* weights, const float* x,
                  float* out, std::string& err);

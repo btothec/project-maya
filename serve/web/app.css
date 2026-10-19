@@ -135,19 +135,21 @@ main { min-height: 0; min-width: 0; display: flex; }
 .tierbar__seg { display: block; height: 100%; transition: width 400ms var(--st-ease); min-width: 0; }
 .tierbar__seg--vram { background: linear-gradient(90deg, var(--st-accent), color-mix(in srgb, var(--st-accent) 70%, var(--st-accent-2))); }
 .tierbar__seg--ram { background: var(--st-info); opacity: .85; }
+.tierbar__seg--helper { background: #8b6ae0; opacity: .85; }
 .tierbar__seg--disk { background: var(--st-warn); opacity: .7; }
 .tierlegend { display: flex; flex-wrap: wrap; gap: var(--st-s-6); font-size: var(--st-fs-sm); }
 .tierlegend__item { display: flex; align-items: center; gap: 8px; color: var(--st-ink-muted); }
 .tierlegend__item b { color: var(--st-ink); font-weight: 600; font-variant-numeric: tabular-nums; }
 .dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
 .dot--vram { background: var(--st-accent); } .dot--ram { background: var(--st-info); } .dot--disk { background: var(--st-warn); }
+.dot--helper { background: #8b6ae0; }
 
 /* ---------------------------------------------------------------- monitor: what fills the GPU */
 /* one hue a part, in the bar's order (each next to the next told apart under the three colour blindnesses, on both
    themes); the expert pool keeps the experts card's VRAM colour, the CUDA context a neutral grey, free the bare track */
 .gpumap-card { position: relative; display: flex; flex-direction: column; gap: var(--st-s-4);
                --gm-weights: #2a78d6; --gm-kv: #1baf7a; --gm-act: #eda100; --gm-drafter: #e87ba4; --gm-pool: var(--st-accent);
-               --gm-vision: #008300; --gm-rest: color-mix(in srgb, var(--st-ink-muted) 60%, var(--st-surface-3)); --gm-other: #eb6834;
+               --gm-helper: #8b6ae0; --gm-vision: #008300; --gm-rest: color-mix(in srgb, var(--st-ink-muted) 60%, var(--st-surface-3)); --gm-other: #eb6834;
                --gm-used: var(--st-accent); }
 [data-theme="dark"] .gpumap-card { --gm-weights: #3987e5; --gm-kv: #199e70; --gm-act: #c98500; --gm-drafter: #d55181;
                                    --gm-other: #d95926; }

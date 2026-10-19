@@ -174,8 +174,8 @@ class GpuMap(unittest.TestCase):
         self.gm = gpu_map
         self.r = gpu_map.parse(LINE)
 
-    def card(self, used, procs, index=0, pci="0000:01:00"):
-        return {"index": index, "pci": pci, "name": "NVIDIA GeForce RTX 3090", "used": used, "total": 25296896000,
+    def card(self, used, procs, index=0, pci="0000:01:00", total=25296896000):
+        return {"index": index, "pci": pci, "name": "NVIDIA GeForce RTX 3090", "used": used, "total": total,
                 "procs": procs}
 
     def test_parse(self):
@@ -233,6 +233,29 @@ class GpuMap(unittest.TestCase):
         b = dict(self.r, layers=[20, 45], slots=700, free=self.r["free"] - GB)
         (m,) = self.gm.merge([a, b])
         self.assertEqual((m["layers"], m["slots"], m["pool"], m["free"]), ([0, 45], 1200, 2 * self.r["pool"], b["free"]))
+
+    # the GPU helper's own card (STRATA_GLM_EXPERT_HELPER on a discrete second GPU), as its start line reports it
+    HELPER = 15461882265
+    HELPER_CTX = 300 * 2**20
+    HELPER_LINE = (f"VRAM dev=1 pci=0000:02:00.0 total=17179869184 free={17179869184 - HELPER - HELPER_CTX} "
+                   f"helper={HELPER} weights=0 kv=0 kv_ram=0 act=0 drafter=0 window=0 pool=0 tail=0 borrow=0 "
+                   "vision=0 slots=0 ctx=0 layers=-1--1\n")
+
+    def test_the_helper_cache_has_its_own_row(self):
+        """The helper's card: one row of its own with the cache as a part; the trunk GPU's row carries none."""
+        hr = self.gm.parse(self.HELPER_LINE)
+        tr = self.gm.parse(LINE)
+        assert hr is not None and tr is not None        # narrow the Optional for the report list below
+        self.assertEqual((hr["dev"], hr["helper"], hr["layers"]), (1, self.HELPER, None))
+        cards = [self.card(90 * GB, {100: 90 * GB}, index=0, pci="0000:01:00"),
+                 self.card(self.HELPER + self.HELPER_CTX, {100: self.HELPER + self.HELPER_CTX}, index=1,
+                           pci="0000:02:00", total=17179869184)]
+        rows = self.gm.view([tr, hr], cards, engine_pid=100)
+        self.assertEqual([g["index"] for g in rows], [0, 1])
+        self.assertEqual(rows[0]["parts"]["helper"], 0)
+        self.assertEqual(rows[1]["parts"]["helper"], self.HELPER)
+        self.assertEqual(rows[1]["parts"]["rest"], self.HELPER_CTX)   # the CUDA context on the cache card
+        self.assertEqual(rows[1]["free"], 17179869184 - self.HELPER - self.HELPER_CTX)
 
     def test_metrics_carry_it(self):
         from types import SimpleNamespace

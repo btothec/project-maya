@@ -6,7 +6,8 @@ driver keeps outside every process (its reserve), that is "CUDA and the rest".""
 from __future__ import annotations
 
 # the VRAM line's byte counts (Glm5Model::VramReport, src/program/generate.cpp)
-BYTES = ("total", "free", "weights", "kv", "kv_ram", "act", "drafter", "window", "pool", "tail", "borrow", "vision")
+BYTES = ("total", "free", "weights", "kv", "kv_ram", "act", "drafter", "window", "pool", "tail", "borrow", "vision",
+         "helper")
 
 
 def parse(line: str) -> dict | None:
@@ -75,7 +76,8 @@ def view(report: list[dict], cards: list[dict] | None, engine_pid: int | None, v
         lent = bool(vision_lent and r.get("vision") and r["dev"] == 0)
         pool = max(0, r.get("pool", 0) - (r.get("tail", 0) if lent else 0))
         parts = {"weights": r.get("weights", 0), "kv": r.get("kv", 0), "act": r.get("act", 0),
-                 "drafter": r.get("drafter", 0) + r.get("window", 0), "pool": pool}
+                 "drafter": r.get("drafter", 0) + r.get("window", 0), "pool": pool,
+                 "helper": r.get("helper", 0)}
         engine = sum(parts.values())
         own, enc = procs.get(engine_pid), procs.get(vision_pid) if vision_pid else None
         vision = enc if enc is not None else r.get("tail", 0) if lent else 0

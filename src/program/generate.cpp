@@ -1027,23 +1027,24 @@ static int glm_pack_generate(const Options& o) {
         // (+ the CPU lane setup's calibration reads: its threads and its PCIe share, as the engine started)
         std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld engine_kind=glm-fast "
                     "experts=%d vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d dflash=%d vision_lend=%zu "
-                    "cpu_threads=%d pcie_share=%.2f logit_bias=1\n",
+                    "cpu_threads=%d pcie_share=%.2f helper=%d helper_dev=%d helper_gb=%.1f logit_bias=1\n",
                     (long long) o.max_context, model.kv_int8() ? "int8" : "fp16", (long long) model.kv_resident(),
                     (long long) st.pool_slots,
                     (long long) (st.pool_gb * 1024.0), model.geometry().n_expert * (model.geometry().n_layers - model.geometry().dense_lead),
                     (long long) st.pool_slots, st.pool_gb, (long long) st.ram_slots, st.ram_gb, model.has_mtp() ? 1 : 0,
-                    model.dflash_ready() ? 1 : 0, model.vision_lend_bytes(), model.cpu_lane_threads(), model.pcie_share());
+                    model.dflash_ready() ? 1 : 0, model.vision_lend_bytes(), model.cpu_lane_threads(), model.pcie_share(),
+                    st.helper_dev >= 0 ? 1 : 0, st.helper_dev, st.helper_gb);
         // the Monitor's map of each GPU: what each part holds on its card, in bytes (Glm5Model::VramReport) - the
         // server finds the card NVML numbers by its PCI address and adds what NVML sees besides
         for (const auto& r : model.vram_report())
             std::printf("VRAM dev=%d pci=%s total=%llu free=%llu weights=%llu kv=%llu kv_ram=%llu act=%llu drafter=%llu "
-                        "window=%llu pool=%llu tail=%llu borrow=%llu vision=%llu slots=%lld ctx=%lld layers=%d-%d\n",
+                        "window=%llu pool=%llu tail=%llu borrow=%llu vision=%llu helper=%llu slots=%lld ctx=%lld layers=%d-%d\n",
                         r.dev, r.pci.empty() ? "-" : r.pci.c_str(), (unsigned long long) r.total,
                         (unsigned long long) r.free, (unsigned long long) r.weights, (unsigned long long) r.kv,
                         (unsigned long long) r.kv_ram, (unsigned long long) r.act, (unsigned long long) r.drafter,
                         (unsigned long long) r.window, (unsigned long long) r.pool, (unsigned long long) r.tail,
-                        (unsigned long long) r.borrow, (unsigned long long) r.vision, (long long) r.slots,
-                        (long long) r.ctx, r.l0, r.l1);
+                        (unsigned long long) r.borrow, (unsigned long long) r.vision, (unsigned long long) r.helper,
+                        (long long) r.slots, (long long) r.ctx, r.l0, r.l1);
     }
 
     strata::kernels::SamplerParams sp;
@@ -1862,13 +1863,18 @@ static int glm_pack_generate(const Options& o) {
                 const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
                 const double n = (double) produced;
                 const uint64_t h = sn.hits - st1.hits, m = sn.misses - st1.misses;
+                const int64_t hf = (long long) (sn.helper_experts - st1.helper_experts);
                 std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f ram_fetch=%.3f disk=%.3f promo=%.3f "
-                            "vram_used=%lld vram_slots=%lld ram_used=%lld ram_slots=%lld ram_gb=%.1f vram_gb=%.1f\n",
+                            "vram_used=%lld vram_slots=%lld ram_used=%lld ram_slots=%lld ram_gb=%.1f vram_gb=%.1f "
+                            "helper_fetch=%.3f helper_hit=%.4f helper_used=%lld helper_ram=%lld helper_gb=%.1f "
+                            "helper_ms_tok=%.2f helper_swaps=%lld\n",
                             n / std::max(1e-9, el), 1000.0 * el / n, (double) h / (double) std::max<uint64_t>(1, h + m),
                             (double) (sn.ram_hits - st1.ram_hits) / n, (double) (sn.disk_reads - st1.disk_reads) / n,
                             (double) (sn.promotions - st1.promotions) / n, (long long) sn.pool_used,
                             (long long) sn.pool_slots, (long long) sn.ram_used, (long long) sn.ram_slots, sn.ram_gb,
-                            sn.pool_gb);
+                            sn.pool_gb, (double) hf / n, (double) hf / (double) std::max<uint64_t>(1, h + m),
+                            (long long) sn.helper_used, (long long) sn.helper_served_ram, sn.helper_gb,
+                            (sn.helper_ms - st1.helper_ms) / n, (long long) sn.helper_swaps);
             }
             bool eos_hit = false;
             for (const int64_t e : eos)
@@ -2190,15 +2196,20 @@ static int glm_pack_generate(const Options& o) {
             const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - multi_t1).count();
             const double n = (double) std::max<uint64_t>(1, multi_n);
             const uint64_t h = sn.hits - multi_st1.hits, m = sn.misses - multi_st1.misses;
+            const int64_t hf = (long long) (sn.helper_experts - multi_st1.helper_experts);
             std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f ram_fetch=%.3f disk=%.3f promo=%.3f "
                         "vram_used=%lld vram_slots=%lld ram_used=%lld ram_slots=%lld ram_gb=%.1f vram_gb=%.1f "
+                        "helper_fetch=%.3f helper_hit=%.4f helper_used=%lld helper_ram=%lld helper_gb=%.1f "
+                        "helper_ms_tok=%.2f helper_swaps=%lld "
                         "active=%zu\n",
                         n / std::max(1e-9, el), 1000.0 * el / n, (double) h / (double) std::max<uint64_t>(1, h + m),
                         (double) (sn.ram_hits - multi_st1.ram_hits) / n,
                         (double) (sn.disk_reads - multi_st1.disk_reads) / n,
                         (double) (sn.promotions - multi_st1.promotions) / n, (long long) sn.pool_used,
                         (long long) sn.pool_slots, (long long) sn.ram_used, (long long) sn.ram_slots, sn.ram_gb,
-                        sn.pool_gb, gens.size());
+                        sn.pool_gb, (double) hf / n, (double) hf / (double) std::max<uint64_t>(1, h + m),
+                        (long long) sn.helper_used, (long long) sn.helper_served_ram, sn.helper_gb,
+                        (sn.helper_ms - multi_st1.helper_ms) / n, (long long) sn.helper_swaps, gens.size());
         }
         for (const int64_t e : eos)
             if (e == tok && stop_on_eos) {
